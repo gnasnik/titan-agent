@@ -29,7 +29,7 @@ function create_vm() {
 
     # Create the virtual machine with Multipass (Ubuntu by default)
     echo "Creating the virtual machine $VM_NAME..."
-    multipass launch --name "$VM_NAME" --cpus 2 --memory 2G --disk 64G
+    multipass launch --name "$VM_NAME" --cpus 2 --memory 2G --disk 64G  -vvvv
 
     # Check if the VM creation was successful
     if [[ $? -ne 0 ]]; then
@@ -55,6 +55,35 @@ function create_vm() {
         echo "Error: Failed to execute script inside the VM." >&2
         exit 1
     fi
+
+    local retry_count=0
+    local max_retries=10
+    local BOX_ID=""
+
+    echo "Checking the status of airship-box-agent.service..."
+    service_status=$(multipass exec "$VM_NAME" -- sudo systemctl is-active airship-box-agent.service)
+
+    if [[ "$service_status" == "active" ]]; then
+        echo "The airship-box-agent.service is running."
+        while [[ $retry_count -lt $max_retries ]]; do
+            # Try to read BOX_ID
+            BOX_ID=$(multipass exec "$VM_NAME" -- cat /opt/.airship/id)
+            if [[ -z "$BOX_ID" ]]; then
+                echo "BOX_ID is not found. Retrying... (Attempt $((retry_count + 1)))"
+            else
+                echo "Successfully read BOX_ID: $BOX_ID"
+                exit 0
+            fi
+            ((retry_count++))
+
+            echo "Retrying in 3 seconds..."
+            sleep 3
+        done
+    fi
+
+    echo "airship-box-agent.service is not running."
+    exit 1
+    
 }
 
 function info() {
@@ -78,6 +107,7 @@ function reinstall() {
     fi
     echo "Creating new Airship VM..."
     create_vm
+    return $?
 }
 
 function restart() {
@@ -148,7 +178,7 @@ function main() {
             status
             ;;
         *)
-            echo "Usage: $0 {install|reinstall|restart|delete|info}" >&2
+            echo "Usage: $0 {install|reinstall|restart|delete|stop|status|info}" >&2
             exit 1
             ;;
     esac
