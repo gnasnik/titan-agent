@@ -5,12 +5,14 @@ function mod.start()
     mod.timerInterval = 60
 
     mod.getBaseInfo()
+    
+    mod.metrics = {status="",client_id="", err=""}
 
-    mod.sendMetrics({status="starting"})
+    mod.metrics.status = "starting"
 
     local err =  mod.run()
     if err then
-        mod.print("Failed to prepare install script: "..err)
+        mod.print("Failed to run script: "..err)
     end
 
     mod.startTimer()
@@ -18,8 +20,11 @@ end
 
 function mod.stop()
     mod.print("mod.stop airship")
+    local err = mod.stopInstance()
+    if err then
+        mod.print("Failed to stop instance: "..err)
+    end
 end
-
 
 function mod.getBaseInfo()
     local agent = require 'agent'
@@ -34,49 +39,204 @@ end
 
 
 function mod.run()
+    -- Ensure the install script path is available
     if not mod.installScriptPath then
         local err = mod.fetchInstallScript()
         if err then
-            return err
+            return "load install script error: " .. err
         end
     end
 
-    local _, err = mod.getBizId()
-    if err then
-        mod.print("Failed to get bizId, seems not installed: "..err)
-        local installErr = mod.install()
-        if installErr then
-            return installErr
+    -- Check and handle status
+    local success = false
+    while not success do
+        local status = mod.status()
+        -- if container running check app status , if app exception, try to reinstall 
+        if status == "RUNNING" then
+            mod.print("Instance is already running.")
+            local id, err = mod.getBizId()
+            if err then
+                mod.print("Running but failed to get bizId: " .. err)
+                mod.metrics.err = err
+                mod.metrics.status = "exception"
+                local err = mod.reinstall() -- Try to reinstall the instance
+                if err then
+                    mod.print("reinstall error: " .. err)
+                else
+                    mod.print("Reinstall completed, rechecking status.")
+                end
+            else
+                mod.metrics.status = "running"
+                mod.metrics.client_id = id
+                success = true
+            end
+        elseif status == "STOPPED" then
+            mod.print("Status STOPPED. Attempting to start the instance.")
+            mod.metrics.status = "starting"
+            local err = mod.startInstance()
+            if err then
+                mod.metrics.err = err
+                mod.print("start instance error: " .. err)
+            else
+                success = true -- Only set success if startInstance succeeds
+            end
+
+        elseif status == "NONE" then
+            mod.print("Status NONE, seems not installed. Attempting to install.")
+            mod.metrics.status = "installing"
+            local installed, err = mod.install()
+            if not installed then
+                mod.metrics.err = err
+                mod.print("install error: " .. err)
+            else
+                mod.print("Install completed, rechecking status.")
+            end
+        else
+            mod.print("Status UNKNOWN: " .. tostring(status) .. ". Attempting to reinstall.")
+            mod.metrics.status = "re-creating"
+            local  err = mod.reinstall()
+            if not err then
+                mod.metrics.err = err
+                mod.print("reinstall error: " .. err)
+            else
+                mod.print("Reinstall completed, rechecking status.")
+            end
+        end
+
+        mod.sleep(3)
+    end
+
+    -- Attempt to retrieve bizId
+    while true do
+        local bizId, err = mod.getBizId()
+        if err then
+            mod.print("Failed to get bizId: " .. err)
+            mod.metrics.err = err
+        else
+            mod.print("Retrieved bizId: " .. bizId)
+            break
         end
     end
-   
+
+    return nil
+end
+
+function mod.sleep(n)
+    os.execute("timeout /t "..n)
+ end
+
+
+function mod.status()
+    local agent = require("agent")
+    local command = mod.installScriptPath .. " status"
+    
+    mod.print("status script: "..command)
+
+    local result, err = agent.exec(command, 60)
+    if err then
+        return "Failed to execute status script: "..err
+    end
+
+    if result.status ~= 0 then
+        return "Status script error: "..result.stderr
+    end
+
+    if result.stderr and result.stderr ~= "" then
+        return "Status script stderr: "..result.stderr
+    end
+
+    if result.stdout then
+        mod.print("Status script output: "..result.stdout)
+    end
+
+    return mod.parseStatus(result.stdout)
+end
+
+
+
+function mod.parseStatus(output)
+    local _, _, status = string.find(output, "STATUS: %s*(%w+)")
+    return string.upper(status)
+end
+
+
+function mod.startInstance()
+    local agent = require("agent")
+    local command = mod.installScriptPath .. " start"
+    
+    mod.print("start script: "..command)
+
+    local result, err = agent.exec(command, 1800)
+    if err then
+        return "Failed to execute start script: "..err
+    end
+
+    if result.status ~= 0 then
+        return "Start script error: "..result.stderr
+    end
+
+    if result.stderr and result.stderr ~= "" then
+        return "Start script stderr: "..result.stderr
+    end
+
+    if result.stdout then
+        mod.print("Start script output: "..result.stdout)
+    end
+
+    return nil
+end
+
+function mod.stopInstance()
+    local agent = require("agent")
+    local command = mod.installScriptPath .. " stop"
+    
+    mod.print("stop script: "..command)
+
+    local result, err = agent.exec(command, 1800)
+    if err then
+        return "Failed to execute stop script: "..err
+    end
+
+    if result.status ~= 0 then
+        return "stop script error: "..result.stderr
+    end
+
+    if result.stderr and result.stderr ~= "" then
+        return "stop script stderr: "..result.stderr
+    end
+
+    if result.stdout then
+        mod.print("stop script output: "..result.stdout)
+    end
+
+    return nil
 end
 
 function mod.install()
     local agent = require("agent")
 
-    local command = mod.installScriptPath .. ' install'
+    local command = mod.installScriptPath .. " install"
 
     mod.print("install script: "..command)
 
-    local result, err = agent.exec(command, 1800)
+    local result, err = agent.exec(command, 1800, true)
     if err then
-        return "Failed to execute install script: "..err
+        return false, "Failed to execute install script: "..err
     end
 
     if result.status ~= 0 then
-        return "Install script error: "..result.stderr
+        return false, "Install script error: "..result.stderr
     end
 
     if result.stderr and result.stderr ~= "" then
-        return "Install script stderr: "..result.stderr
+        return false, "Install script stderr: "..result.stderr
     end
 
     if result.stdout then
         mod.print("Install script output: "..result.stdout)
     end
 
-    return nil
+    return true, nil
 end
 
 function mod.reinstall()
@@ -84,7 +244,7 @@ function mod.reinstall()
     local command = mod.installScriptPath .. ' reinstall' 
     mod.print("reinstall script: "..command)
 
-    local result, err = agent.exec(command, 1800) 
+    local result, err = agent.exec(command, 1800, true) 
     if err then
         return "Failed to execute reinstall script: "..err
     end
@@ -107,7 +267,7 @@ end
 
 function mod.fetchInstallScript()
     local scriptName = "install-airship.bat"
-    local scriptURL = "https://gist.githubusercontent.com/gnasnik/b411f8f5426d926ee4fd74cdb7c8fb06/raw/befc42ba87124af42e0587200d7dc7627b27909c/airship-install.bat"
+    local scriptURL = "https://gist.githubusercontent.com/gnasnik/b411f8f5426d926ee4fd74cdb7c8fb06/raw/b0b23df6cd7f512f591e03795a724516f1bf4fef/airship-install.bat"
     -- local scriptPath = mod.info.appDir .. "/" .. scriptName
 
     -- check script path is absolute or relative to appDir
